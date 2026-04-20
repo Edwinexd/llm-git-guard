@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# ssh-authd: user-facing ssh wrapper for hosts where llm-git-guard is active.
+#
+# An ordinary user whose ~/.ssh/ has no key lands here when they type `ssh`
+# (because ~/.local/bin/ssh is symlinked to this script). The wrapper
+# refuses GitHub SSH targets, then forwards the invocation to a narrow
+# privileged helper (ssh-authd-exec) that knows how to read root's SSH key.
+#
+# `scp`/`sftp` also call `ssh` via PATH, so symlinking those to this script
+# too hooks them automatically.
+
+set -u
+
+BLOCKED_HOSTS_RE='(^|@)((ssh\.)?github\.com|.*\.github\.com)(:|$)'
+
+for a in "$@"; do
+    if [[ "$a" =~ $BLOCKED_HOSTS_RE ]]; then
+        cat >&2 <<EOF
+ssh-authd: SSH to GitHub is blocked for this user.
+    For git operations use the llm-git-guard proxy:
+        http://127.0.0.1:9419/<owner>/<repo>.git
+    For debugging, you can still escalate explicitly:
+        sudo ssh -i /root/.ssh/id_ed25519 git@github.com
+EOF
+        exit 1
+    fi
+done
+
+exec /usr/bin/sudo -n /usr/local/sbin/ssh-authd-exec "$@"

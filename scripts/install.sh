@@ -66,4 +66,7 @@ Next steps:
          ln -sf $PREFIX/scripts/gh-sync ~/.local/bin/gh-sync
   3. Make sure /root/.ssh/id_ed25519 is your GitHub key and your user no
      longer has a copy.
+  4. Optional: install the ssh-authd wrapper so ordinary ssh/scp/sftp for
+     your user go through root's key and refuse GitHub targets:
+         sudo $PREFIX/scripts/install-ssh-authd.sh <username>
 EOF

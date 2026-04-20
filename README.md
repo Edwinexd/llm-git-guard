@@ -92,6 +92,34 @@ sudo install -m 600 -o root -g root ~/.ssh/known_hosts /root/.ssh/known_hosts
 shred -u ~/.ssh/id_ed25519       # keep .pub if you want to see what's registered
 ```
 
+### Optional: ssh-authd wrapper
+
+Once the SSH key lives only at `/root/.ssh/id_ed25519`, the user account has
+no working `ssh` for any host that was authorised with that key. Two ways to
+get it back:
+
+- Run `sudo ssh -i /root/.ssh/id_ed25519 user@host` when you need it. No
+  extra setup, but noisy.
+- Install `ssh-authd`:
+
+  ```sh
+  sudo /opt/llm-git-guard/scripts/install-ssh-authd.sh <username>
+  ```
+
+  `ssh-authd` is a tiny wrapper that a) refuses GitHub SSH targets, and
+  b) forwards everything else to a privileged helper that runs
+  `/usr/bin/ssh` with root's key under a narrow passwordless sudo rule.
+  The installer symlinks `~<username>/.local/bin/{ssh,scp,sftp}` to the
+  wrapper, so normal tools pick it up via PATH.
+
+  Net effect for that user:
+  * `ssh other-server`, `scp`, `sftp`, and anything else that calls `ssh`
+    via `PATH` — work without any sudo prompt, using root's key.
+  * `ssh git@github.com` / `scp file github.com:/tmp/` — refused with a
+    hint pointing at the llm-git-guard proxy.
+  * `sudo ssh -i /root/.ssh/id_ed25519 git@github.com` — still works for
+    deliberate debugging; the wrapper is only in the user's PATH.
+
 ## Uninstall
 
 ```sh

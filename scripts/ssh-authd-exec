@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# ssh-authd-exec: privileged helper invoked by ssh-authd via a narrow
+# passwordless sudo rule. Runs the real /usr/bin/ssh with root's SSH key.
+#
+# The github-block is enforced here too (defence in depth): even if someone
+# invokes this directly via `sudo -n /usr/local/sbin/ssh-authd-exec ...`,
+# they cannot use it to reach GitHub. Git pushes/fetches to GitHub must go
+# through the llm-git-guard proxy; interactive debugging is available via
+# `sudo ssh -i /root/.ssh/id_ed25519 git@github.com` which skips this
+# wrapper entirely (and is a clear, deliberate action).
+
+set -u
+
+KEY=${LLMGG_SSH_KEY:-/root/.ssh/id_ed25519}
+KNOWN_HOSTS=${LLMGG_KNOWN_HOSTS:-/root/.ssh/known_hosts}
+BLOCKED_HOSTS_RE='(^|@)((ssh\.)?github\.com|.*\.github\.com)(:|$)'
+
+for a in "$@"; do
+    if [[ "$a" =~ $BLOCKED_HOSTS_RE ]]; then
+        echo "ssh-authd-exec: github targets refused" >&2
+        exit 1
+    fi
+done
+
+exec /usr/bin/ssh \
+    -i "$KEY" \
+    -o "UserKnownHostsFile=$KNOWN_HOSTS" \
+    -o "IdentitiesOnly=yes" \
+    -o "StrictHostKeyChecking=accept-new" \
+    "$@"
