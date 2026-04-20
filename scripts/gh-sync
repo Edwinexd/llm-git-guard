@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Drop-in replacement for ~/.local/bin/gh-sync that clones and fetches through
+# llm-git-guard instead of direct SSH. Also keeps origin repointed for any
+# repo whose remote has drifted.
+set -uo pipefail
+
+REPOS_DIR="${REPOS_DIR:-$HOME/repos}"
+LOG_DIR="$HOME/.local/share/gh-sync"
+LOG_FILE="$LOG_DIR/sync.log"
+CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
+PROXY="${LLMGG_PROXY:-http://127.0.0.1:9419}"
+
+mkdir -p "$REPOS_DIR" "$LOG_DIR" "$CLAUDE_PROJECTS_DIR"
+
+register_project() {
+    local path="$1"
+    local id
+    id=$(printf '%s' "$path" | sed 's|[^a-zA-Z0-9-]|-|g')
+    mkdir -p "$CLAUDE_PROJECTS_DIR/$id"
+}
+
+{
+    echo "=== $(date -Iseconds) gh-sync (proxy=$PROXY) start ==="
+
+    gh api --paginate \
+        '/user/repos?affiliation=owner,collaborator,organization_member&per_page=100' \
+        --jq '.[] | select(.archived == false) | "\(.owner.login)\t\(.name)"' |
+    while IFS=$'\t' read -r owner name; do
+        dest="$REPOS_DIR/$owner/$name"
+        proxy_url="$PROXY/$owner/$name.git"
+
+        if [[ -d "$dest/.git" ]]; then
+            current=$(git -C "$dest" config --get remote.origin.url 2>/dev/null || true)
+            if [[ "$current" != "$proxy_url" ]]; then
+                git -C "$dest" remote set-url origin "$proxy_url"
+                echo "repoint: $owner/$name ($current -> $proxy_url)"
+            fi
+            if git -C "$dest" fetch --prune --quiet 2>/dev/null; then
+                echo "fetch ok: $owner/$name"
+            else
+                echo "fetch FAIL: $owner/$name"
+            fi
+        else
+            mkdir -p "$REPOS_DIR/$owner"
+            if git clone --quiet "$proxy_url" "$dest" 2>/dev/null; then
+                echo "clone ok: $owner/$name"
+            else
+                echo "clone FAIL: $owner/$name"
+            fi
+        fi
+        register_project "$dest"
+    done
+
+    echo "=== $(date -Iseconds) gh-sync done ==="
+} 2>&1 | tee -a "$LOG_FILE"

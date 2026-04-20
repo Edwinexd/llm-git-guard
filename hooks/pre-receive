@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# llm-git-guard pre-receive hook.
+#
+# Invoked by git-receive-pack inside a bare mirror under REPOS_DIR. Reads
+# "<old> <new> <ref>" lines on stdin, validates the push, and if every ref
+# passes, forwards them atomically to the upstream GitHub remote using root's
+# SSH key. Only if upstream accepts does the local ref update happen.
+
+set -uo pipefail
+
+OWNER="${LLMGG_OWNER:-unknown}"
+REPO="${LLMGG_REPO:-unknown}"
+REPO_ID="${OWNER}/${REPO}"
+SSH_KEY="${LLMGG_SSH_KEY:-/root/.ssh/id_ed25519}"
+KNOWN_HOSTS="${LLMGG_KNOWN_HOSTS:-/root/.ssh/known_hosts}"
+CONFIG_DIR="${LLMGG_CONFIG_DIR:-/etc/llm-git-guard}"
+EXEMPT_FILE="${CONFIG_DIR}/exempt-repos.txt"
+
+MAX_DELETED_LINES="${LLMGG_MAX_DELETED_LINES:-2000}"
+MAX_DELETED_FILES="${LLMGG_MAX_DELETED_FILES:-50}"
+# These are the forbidden LLM-vendor identifiers. Stored base64 so the source
+# of llm-git-guard itself does not trip its own filter when the repo is pushed
+# through the proxy. Decoded at runtime.
+FORBIDDEN_RE="${LLMGG_FORBIDDEN_RE:-$(printf %s Y2xhdWRlfGNvZGV4 | base64 -d)}"
+
+say() { printf 'llm-git-guard: %s\n' "$*" >&2; }
+
+exempt=0
+if [[ -f "$EXEMPT_FILE" ]] && grep -qFx "$REPO_ID" "$EXEMPT_FILE"; then
+    exempt=1
+    say "note: $REPO_ID is exempt from token checks (force-push and deletion limits still enforced)"
+fi
+
+fail=0
+declare -a refspecs=()
+
+empty_tree=$(git hash-object -t tree /dev/null 2>/dev/null \
+             || echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904)
+
+while read -r old new ref; do
+    [[ -z "${ref:-}" ]] && continue
+
+    # Ref deletion (new == 40 zeros).
+    if [[ "$new" =~ ^0+$ ]]; then
+        say "REJECT $ref: ref deletion is forbidden"
+        fail=1
+        continue
+    fi
+
+    # Ref name must not mention the forbidden vendors.
+    if (( ! exempt )) && echo "$ref" | grep -qiE "$FORBIDDEN_RE"; then
+        say "REJECT $ref: ref name matches /$FORBIDDEN_RE/i"
+        fail=1
+        continue
+    fi
+
+    if [[ "$old" =~ ^0+$ ]]; then
+        base="$empty_tree"
+        # New ref -- look at commits reachable from $new but nowhere else.
+        mapfile -t commits < <(git rev-list "$new" --not --branches --tags --remotes 2>/dev/null | head -1000)
+    else
+        # Fast-forward check. Non-ancestor means rewind/force.
+        if ! git merge-base --is-ancestor "$old" "$new"; then
+            say "REJECT $ref: non-fast-forward (force push / rewind)"
+            fail=1
+            continue
+        fi
+        base="$old"
+        mapfile -t commits < <(git rev-list "$old..$new")
+    fi
+
+    # Commit metadata (author, committer, message) must not mention forbidden.
+    if (( ! exempt )); then
+        for sha in "${commits[@]}"; do
+            [[ -z "$sha" ]] && continue
+            meta=$(git log -1 --format='%an%n%ae%n%cn%n%ce%n%s%n%b' "$sha")
+            if echo "$meta" | grep -qiE "$FORBIDDEN_RE"; then
+                say "REJECT $ref: commit $sha metadata matches /$FORBIDDEN_RE/i"
+                git log -1 --format='    author=%an <%ae>%n    subject=%s' "$sha" >&2
+                fail=1
+            fi
+        done
+    fi
+
+    # Diff additions must not contain forbidden tokens.
+    if (( ! exempt )); then
+        added_hits=$(git diff --unified=0 "$base" "$new" 2>/dev/null \
+            | awk '/^\+\+\+/ {next} /^\+/ {print}' \
+            | grep -iE "$FORBIDDEN_RE" \
+            | head -10 || true)
+        if [[ -n "$added_hits" ]]; then
+            say "REJECT $ref: added lines contain /$FORBIDDEN_RE/i"
+            echo "$added_hits" | sed 's/^/    /' >&2
+            fail=1
+        fi
+    fi
+
+    # Deletion budget.
+    shortstat=$(git diff --shortstat "$base" "$new" 2>/dev/null || true)
+    del_lines=$(echo "$shortstat" | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' | head -1)
+    del_lines=${del_lines:-0}
+    del_files=$(git diff --name-status "$base" "$new" 2>/dev/null | awk '$1=="D"' | wc -l)
+    if (( del_lines > MAX_DELETED_LINES )); then
+        say "REJECT $ref: removes $del_lines lines (cap is $MAX_DELETED_LINES)"
+        fail=1
+    fi
+    if (( del_files > MAX_DELETED_FILES )); then
+        say "REJECT $ref: removes $del_files files (cap is $MAX_DELETED_FILES)"
+        fail=1
+    fi
+
+    refspecs+=("${new}:${ref}")
+done
+
+if (( fail )); then
+    say "push rejected; no refs updated"
+    exit 1
+fi
+
+if (( ${#refspecs[@]} == 0 )); then
+    exit 0
+fi
+
+export GIT_SSH_COMMAND="/usr/bin/ssh -i ${SSH_KEY} -o IdentitiesOnly=yes -o UserKnownHostsFile=${KNOWN_HOSTS} -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+
+say "forwarding ${#refspecs[@]} ref(s) to upstream: ${refspecs[*]}"
+if ! git push --atomic upstream "${refspecs[@]}" >&2; then
+    say "upstream push failed; rejecting to keep mirror consistent"
+    exit 1
+fi
+
+exit 0
