@@ -3,8 +3,8 @@
 #
 # Invoked by git-receive-pack inside a bare mirror under REPOS_DIR. Reads
 # "<old> <new> <ref>" lines on stdin, validates the push, and if every ref
-# passes, forwards them atomically to the upstream GitHub remote using root's
-# SSH key. Only if upstream accepts does the local ref update happen.
+# passes, forwards accepted refs to the upstream GitHub URL using root's SSH
+# key. Only if upstream accepts does the local ref update happen.
 
 set -uo pipefail
 
@@ -18,12 +18,27 @@ EXEMPT_FILE="${CONFIG_DIR}/exempt-repos.txt"
 
 MAX_DELETED_LINES="${LLMGG_MAX_DELETED_LINES:-2000}"
 MAX_DELETED_FILES="${LLMGG_MAX_DELETED_FILES:-50}"
-# These are the forbidden LLM-vendor identifiers. Stored base64 so the source
-# of llm-git-guard itself does not trip its own filter when the repo is pushed
+# Forbidden LLM-vendor identifiers. Stored base64 so the source of
+# llm-git-guard itself does not trip its own filter when the repo is pushed
 # through the proxy. Decoded at runtime.
 FORBIDDEN_RE="${LLMGG_FORBIDDEN_RE:-$(printf %s Y2xhdWRlfGNvZGV4 | base64 -d)}"
+# Refs whose deletion is always refused. The mirror's HEAD (the repo's
+# default branch on GitHub) is also protected, dynamically.
+PROTECTED_REFS_RE="${LLMGG_PROTECTED_REFS_RE:-^refs/heads/(main|master|develop|trunk|prod|production|release/.*)\$}"
 
 say() { printf 'llm-git-guard: %s\n' "$*" >&2; }
+
+# Resolve the mirror's default branch -- this is what GitHub says is the
+# repo's default, because git-clone --mirror copies the remote HEAD symref.
+default_ref="$(git symbolic-ref HEAD 2>/dev/null || true)"
+
+is_protected_ref() {
+    local r="$1"
+    if [[ -n "$default_ref" && "$r" == "$default_ref" ]]; then
+        return 0
+    fi
+    echo "$r" | grep -qE "$PROTECTED_REFS_RE"
+}
 
 exempt=0
 if [[ -f "$EXEMPT_FILE" ]] && grep -qFx "$REPO_ID" "$EXEMPT_FILE"; then
@@ -40,10 +55,22 @@ empty_tree=$(git hash-object -t tree /dev/null 2>/dev/null \
 while read -r old new ref; do
     [[ -z "${ref:-}" ]] && continue
 
-    # Ref deletion (new == 40 zeros).
+    # Ref deletion (new == 40 zeros). Permitted for non-protected refs --
+    # feature branches, obsolete topic branches, etc. are legitimate to
+    # delete. The default branch and anything matching PROTECTED_REFS_RE
+    # stays locked.
     if [[ "$new" =~ ^0+$ ]]; then
-        say "REJECT $ref: ref deletion is forbidden"
-        fail=1
+        if is_protected_ref "$ref"; then
+            say "REJECT $ref: deletion of protected ref is forbidden"
+            if [[ -n "$default_ref" && "$ref" == "$default_ref" ]]; then
+                say "    (this is the repo's default branch)"
+            else
+                say "    (matches /$PROTECTED_REFS_RE/)"
+            fi
+            fail=1
+            continue
+        fi
+        refspecs+=(":${ref}")
         continue
     fi
 
@@ -56,10 +83,8 @@ while read -r old new ref; do
 
     if [[ "$old" =~ ^0+$ ]]; then
         base="$empty_tree"
-        # New ref -- look at commits reachable from $new but nowhere else.
         mapfile -t commits < <(git rev-list "$new" --not --branches --tags --remotes 2>/dev/null | head -1000)
     else
-        # Fast-forward check. Non-ancestor means rewind/force.
         if ! git merge-base --is-ancestor "$old" "$new"; then
             say "REJECT $ref: non-fast-forward (force push / rewind)"
             fail=1
@@ -123,8 +148,21 @@ fi
 
 export GIT_SSH_COMMAND="/usr/bin/ssh -i ${SSH_KEY} -o IdentitiesOnly=yes -o UserKnownHostsFile=${KNOWN_HOSTS} -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
 
+upstream_url=$(git config --get remote.upstream.url)
+if [[ -z "$upstream_url" ]]; then
+    say "upstream remote URL missing; cannot forward"
+    exit 1
+fi
+
 say "forwarding ${#refspecs[@]} ref(s) to upstream: ${refspecs[*]}"
-if ! git push --atomic upstream "${refspecs[@]}" >&2; then
+# Push to the URL directly rather than the named remote. With a named remote
+# git would follow remote.<name>.fetch to update tracking refs locally after
+# a successful push -- and the mirror's fetch refspec (+refs/*:refs/*) writes
+# those right back into refs/heads/*, racing git-receive-pack's own pending
+# ref update. Passing the URL skips all remote-config plumbing, so the push
+# has no side effects on local refs and receive-pack can apply the client's
+# update cleanly.
+if ! git push --atomic "$upstream_url" "${refspecs[@]}" >&2; then
     say "upstream push failed; rejecting to keep mirror consistent"
     exit 1
 fi

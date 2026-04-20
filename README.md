@@ -37,7 +37,11 @@ carry obvious vendor fingerprints.
 The `pre-receive` hook reads `<old> <new> <ref>` lines from `git-receive-pack`
 and rejects the push if any ref:
 
-- is being deleted (`new == 0000…`),
+- is being deleted *and* is protected — the repo's default branch (taken from
+  the mirror's `HEAD` symref) or any ref matching `LLMGG_PROTECTED_REFS_RE`
+  (default: `main`, `master`, `develop`, `trunk`, `prod`, `production`,
+  `release/*`). Deletion of ordinary topic / feature branches is allowed and
+  forwarded to GitHub.
 - isn't a fast-forward (force push or rewind),
 - has a name that matches the forbidden-vendor regex,
 - contains a commit whose author, committer, subject, or body matches the regex,
@@ -112,6 +116,7 @@ in `docker-compose.yml` or with a `.env` file next to it.
 | `LLMGG_MAX_DELETED_LINES` | `2000` | reject any ref whose update deletes more lines |
 | `LLMGG_MAX_DELETED_FILES` | `50` | ... or more files |
 | `LLMGG_FORBIDDEN_RE` | vendor pattern | regex applied case-insensitively |
+| `LLMGG_PROTECTED_REFS_RE` | `^refs/heads/(main\|master\|develop\|trunk\|prod\|production\|release/.*)$` | refs whose deletion is always refused (default branch is also protected dynamically) |
 | `LLMGG_LOG_LEVEL` | `info` | Python/Uvicorn log level |
 
 ## Development
