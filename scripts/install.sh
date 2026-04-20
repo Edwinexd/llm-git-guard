@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Install llm-git-guard system-wide: place sources under /opt, data under
-# /var/lib, config under /etc, then enable the systemd service.
+# Install llm-git-guard: provision host directories, build the container
+# image, and bring up the service with docker compose.
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
@@ -12,15 +12,23 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PREFIX=/opt/llm-git-guard
 DATA_DIR=/var/lib/llm-git-guard
 CONFIG_DIR=/etc/llm-git-guard
-SYSTEMD_UNIT=/etc/systemd/system/llm-git-guard.service
 
-echo "==> files -> $PREFIX"
-install -d -m 755 "$PREFIX/src/llm_git_guard" "$PREFIX/hooks" "$PREFIX/scripts"
-install -m 755 "$REPO_ROOT/src/llm_git_guard/server.py"    "$PREFIX/src/llm_git_guard/server.py"
-install -m 644 "$REPO_ROOT/src/llm_git_guard/__init__.py"  "$PREFIX/src/llm_git_guard/__init__.py"
-install -m 755 "$REPO_ROOT/hooks/pre-receive"              "$PREFIX/hooks/pre-receive"
-install -m 755 "$REPO_ROOT/scripts/rewrite-origins.sh"     "$PREFIX/scripts/rewrite-origins.sh"
-install -m 755 "$REPO_ROOT/scripts/gh-sync"                "$PREFIX/scripts/gh-sync"
+if ! command -v docker >/dev/null 2>&1; then
+    echo "install.sh: docker not found in PATH" >&2
+    exit 1
+fi
+if ! docker compose version >/dev/null 2>&1; then
+    echo "install.sh: 'docker compose' plugin not available" >&2
+    exit 1
+fi
+
+echo "==> project files -> $PREFIX"
+install -d -m 755 "$PREFIX"
+# tar-pipe keeps us portable when rsync isn't installed (common on slim hosts).
+tar -C "$REPO_ROOT" \
+    --exclude=.git --exclude=__pycache__ --exclude='*.pyc' \
+    --exclude=.venv --exclude=.mypy_cache --exclude=.pytest_cache \
+    -cf - . | tar -C "$PREFIX" -xf -
 
 echo "==> data dir -> $DATA_DIR"
 install -d -m 755 "$DATA_DIR/repos"
@@ -33,23 +41,29 @@ else
     echo "   (leaving existing $CONFIG_DIR/exempt-repos.txt untouched)"
 fi
 
-echo "==> systemd unit -> $SYSTEMD_UNIT"
-install -m 644 "$REPO_ROOT/systemd/llm-git-guard.service" "$SYSTEMD_UNIT"
-systemctl daemon-reload
-systemctl enable --now llm-git-guard.service
-systemctl --no-pager --full status llm-git-guard.service || true
+echo "==> SSH key sanity check"
+if [[ ! -f /root/.ssh/id_ed25519 ]]; then
+    echo "   WARNING: /root/.ssh/id_ed25519 missing -- upstream pushes will fail"
+fi
+if [[ ! -f /root/.ssh/known_hosts ]]; then
+    echo "   WARNING: /root/.ssh/known_hosts missing -- StrictHostKeyChecking may fail"
+fi
+
+echo "==> docker compose build + up"
+cd "$PREFIX"
+docker compose build
+docker compose up -d
+docker compose ps
 
 cat <<EOF
 
-==> installed. what's next:
+==> installed.
 
-  1. confirm /root/.ssh/id_ed25519 is registered with GitHub and that
-     /root/.ssh/known_hosts contains github.com.
-  2. as your normal user, repoint existing clones to the proxy:
+Next steps:
+  1. From your normal user, repoint existing clones:
          $PREFIX/scripts/rewrite-origins.sh
-  3. replace ~/.local/bin/gh-sync with the proxy-aware version so future
-     clones come through llm-git-guard from the start:
+  2. Swap gh-sync so new clones come through llm-git-guard:
          ln -sf $PREFIX/scripts/gh-sync ~/.local/bin/gh-sync
-  4. remove the SSH key from your user account so direct git pushes are
-     impossible; only root (and therefore the proxy) has it.
+  3. Make sure /root/.ssh/id_ed25519 is your GitHub key and your user no
+     longer has a copy.
 EOF

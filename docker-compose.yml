@@ -1,0 +1,28 @@
+services:
+  llm-git-guard:
+    build: .
+    image: llm-git-guard:local
+    container_name: llm-git-guard
+    restart: unless-stopped
+    # Bind to localhost only -- the guardrail is for processes on this box.
+    ports:
+      - "127.0.0.1:9419:9419"
+    volumes:
+      # Persistent bare mirrors.
+      - /var/lib/llm-git-guard/repos:/var/lib/llm-git-guard/repos
+      # Exemption list and any future config.
+      - /etc/llm-git-guard:/etc/llm-git-guard:ro
+      # Root-only SSH key on the host, mounted read-only.
+      - /root/.ssh/id_ed25519:/root/.ssh/id_ed25519:ro
+      - /root/.ssh/known_hosts:/root/.ssh/known_hosts:ro
+    environment:
+      LLMGG_LOG_LEVEL: info
+    # Minimum capabilities; the process only needs to read/write its data dir
+    # and make outbound TCP to GitHub.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: false
+    tmpfs:
+      - /tmp
