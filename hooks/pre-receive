@@ -82,7 +82,22 @@ while read -r old new ref; do
     fi
 
     if [[ "$old" =~ ^0+$ ]]; then
-        base="$empty_tree"
+        # New-branch push: no "old..new" range exists. For the diff scope
+        # we want "what does this push add on top of what the mirror
+        # already has", not "everything in the whole tree". Pick the
+        # newest ancestor of $new that is reachable from some other ref
+        # (the fork point). rev-list --boundary prints such commits
+        # prefixed with '-' in topological newest-first order, so the
+        # first '-' line is the best base.
+        #
+        # Falling back to $empty_tree would re-introduce the bug this
+        # block exists to prevent: diffing against the empty tree makes
+        # every file (including .gitignore entries and pre-existing
+        # symlinks) look "added", so the forbidden-token scan and the
+        # deletion budget both see the whole tree rather than the push.
+        base=$(git rev-list --boundary "$new" --not --branches --tags --remotes 2>/dev/null \
+               | awk '/^-/ {sub(/^-/, ""); print; exit}')
+        base="${base:-$empty_tree}"
         mapfile -t commits < <(git rev-list "$new" --not --branches --tags --remotes 2>/dev/null | head -1000)
     else
         if ! git merge-base --is-ancestor "$old" "$new"; then
@@ -107,16 +122,81 @@ while read -r old new ref; do
         done
     fi
 
-    # Diff additions must not contain forbidden tokens.
+    # Diff additions must not contain forbidden tokens. Content is scanned
+    # with per-file context so a narrow allowance can be applied:
+    #
+    #   * `.claude` / `.codex` entries inside a `.gitignore` are legitimate
+    #     ignore patterns (agent scratch dirs, worktree roots, etc.) and
+    #     carry no LLM-authored content. Flagging them would force every
+    #     repo on this box to either delete those entries or opt into the
+    #     exemption list.
+    #
+    # The awk stage annotates each added line with the file it belongs to
+    # so the bash loop can decide per-line whether to keep or drop it.
     if (( ! exempt )); then
-        added_hits=$(git diff --unified=0 "$base" "$new" 2>/dev/null \
-            | awk '/^\+\+\+/ {next} /^\+/ {print}' \
-            | grep -iE "$FORBIDDEN_RE" \
-            | head -10 || true)
+        raw_hits=$(git diff --unified=0 "$base" "$new" 2>/dev/null \
+            | awk '
+                /^diff --git / {
+                    file = $NF; sub(/^"?b\//, "", file); sub(/"$/, "", file);
+                    next
+                }
+                /^\+\+\+/ { next }
+                /^\+/     { print file "\t" $0 }
+              ' \
+            | grep -iE $'^[^\t]*\t\\+.*('"$FORBIDDEN_RE"$')' || true)
+
+        added_hits=""
+        hit_count=0
+        if [[ -n "$raw_hits" ]]; then
+            while IFS=$'\t' read -r hit_file hit_line; do
+                case "$hit_file" in
+                    .gitignore|*/.gitignore)
+                        # Strip comment and surrounding whitespace; then
+                        # check against the allowed ignore-pattern shape.
+                        stripped="${hit_line#+}"
+                        stripped="${stripped%%#*}"
+                        stripped="${stripped#"${stripped%%[![:space:]]*}"}"
+                        stripped="${stripped%"${stripped##*[![:space:]]}"}"
+                        if [[ "$stripped" =~ ^!?\.?(claude|codex)/?$ ]]; then
+                            continue
+                        fi
+                        ;;
+                esac
+                added_hits+="${hit_file}: ${hit_line}"$'\n'
+                hit_count=$((hit_count + 1))
+                (( hit_count >= 10 )) && break
+            done <<<"$raw_hits"
+        fi
+
         if [[ -n "$added_hits" ]]; then
             say "REJECT $ref: added lines contain /$FORBIDDEN_RE/i"
-            echo "$added_hits" | sed 's/^/    /' >&2
+            printf '%s' "$added_hits" | sed 's/^/    /' >&2
             fail=1
+        fi
+    fi
+
+    # Structural policy: if the pushed tip contains CLAUDE.md, it must be
+    # a symlink (mode 120000) whose target is AGENTS.md. Canonical agent
+    # docs live in AGENTS.md; CLAUDE.md exists only so Claude-flavored
+    # tooling finds the same content via its conventional filename. A
+    # regular CLAUDE.md file would mean a divergent, likely agent-authored
+    # copy -- exactly the thing this guard exists to block.
+    if (( ! exempt )); then
+        entry=$(git ls-tree "$new" CLAUDE.md 2>/dev/null)
+        if [[ -n "$entry" ]]; then
+            # ls-tree format: "<mode> <type> <sha>\t<path>"
+            claude_mode=$(awk '{print $1}' <<<"$entry")
+            claude_obj=$(awk '{print $3}' <<<"$entry")
+            if [[ "$claude_mode" != "120000" ]]; then
+                say "REJECT $ref: CLAUDE.md exists with mode $claude_mode; must be a symlink (120000) to AGENTS.md"
+                fail=1
+            else
+                claude_target=$(git cat-file blob "$claude_obj" 2>/dev/null)
+                if [[ "$claude_target" != "AGENTS.md" ]]; then
+                    say "REJECT $ref: CLAUDE.md symlink points to '$claude_target'; must point to AGENTS.md"
+                    fail=1
+                fi
+            fi
         fi
     fi
 
