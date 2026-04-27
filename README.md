@@ -46,7 +46,11 @@ and rejects the push if any ref:
 - has a name that matches the forbidden-vendor regex,
 - contains a commit whose author, committer, subject, or body matches the regex,
 - adds any line that matches the regex,
-- exceeds the configured line or file deletion cap.
+- exceeds the configured line or file deletion cap,
+- contains a commit whose subject is longer than `LLMGG_SUBJECT_MAX` chars,
+  whose message has any non-empty body, or whose message contains
+  ` -- ` (space-dash-dash-space). These subject-hygiene rules apply even
+  to repos in `exempt-repos.txt`.
 
 If every ref passes, the hook forwards them atomically to the `upstream`
 remote with `git push --atomic`. Only if upstream accepts does the local
@@ -143,6 +147,7 @@ in `docker-compose.yml` or with a `.env` file next to it.
 | `LLMGG_REFRESH_INTERVAL` | `30` (s) | minimum gap between upstream refreshes per mirror |
 | `LLMGG_MAX_DELETED_LINES` | `2000` | reject any ref whose update deletes more lines |
 | `LLMGG_MAX_DELETED_FILES` | `50` | ... or more files |
+| `LLMGG_SUBJECT_MAX` | `72` | max commit subject length (chars). New commits with longer subjects, non-empty bodies, or ` -- ` in the message are rejected. Applies to all repos including those in `exempt-repos.txt`. |
 | `LLMGG_FORBIDDEN_RE` | vendor pattern | regex applied case-insensitively |
 | `LLMGG_PROTECTED_REFS_RE` | `^refs/heads/(main\|master\|develop\|trunk\|prod\|production\|release/.*)$` | refs whose deletion is always refused (default branch is also protected dynamically) |
 | `LLMGG_LOG_LEVEL` | `info` | Python/Uvicorn log level |

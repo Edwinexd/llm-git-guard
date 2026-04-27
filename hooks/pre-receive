@@ -18,6 +18,11 @@ EXEMPT_FILE="${CONFIG_DIR}/exempt-repos.txt"
 
 MAX_DELETED_LINES="${LLMGG_MAX_DELETED_LINES:-2000}"
 MAX_DELETED_FILES="${LLMGG_MAX_DELETED_FILES:-50}"
+# Cap on commit subject length (chars). 72 is the standard git subject
+# convention; new commits exceeding it are rejected. This rule, like the
+# multi-line and " -- " checks below, applies even to exempt repos --
+# subject hygiene is unrelated to vendor-identifier exemptions.
+SUBJECT_MAX="${LLMGG_SUBJECT_MAX:-72}"
 # Forbidden LLM-vendor identifiers. Stored base64 so the source of
 # llm-git-guard itself does not trip its own filter when the repo is pushed
 # through the proxy. Decoded at runtime.
@@ -121,6 +126,41 @@ while read -r old new ref; do
             fi
         done
     fi
+
+    # Commit message hygiene. Every commit introduced by this push must
+    # have a short, single-line message:
+    #   * subject (%s) <= SUBJECT_MAX chars
+    #   * body (%b) is empty (no trailers, no explanation paragraphs)
+    #   * the full message contains no " -- " (space-dash-dash-space) --
+    #     LLM agents have a habit of writing prose-style em-dash-as-
+    #     double-hyphen which clutters `git log --oneline` and is almost
+    #     always wrong in a commit subject.
+    # Applies even to exempt repos: this is style policy, not vendor
+    # detection, and llm-git-guard's own commits should follow it too.
+    for sha in "${commits[@]}"; do
+        [[ -z "$sha" ]] && continue
+        subject=$(git log -1 --format='%s' "$sha")
+        # $() strips trailing newlines, so an empty body really tests as "".
+        body=$(git log -1 --format='%b' "$sha")
+        full=$(git log -1 --format='%B' "$sha")
+        if (( ${#subject} > SUBJECT_MAX )); then
+            say "REJECT $ref: commit $sha subject is ${#subject} chars (cap is $SUBJECT_MAX)"
+            say "    subject: $subject"
+            fail=1
+        fi
+        # Treat whitespace-only bodies as empty -- some editors leave a
+        # trailing blank line and we don't want to reject for that.
+        if [[ "$body" =~ [^[:space:]] ]]; then
+            say "REJECT $ref: commit $sha has a multi-line message (subject only, body must be empty)"
+            say "    subject: $subject"
+            fail=1
+        fi
+        if [[ "$full" == *" -- "* ]]; then
+            say "REJECT $ref: commit $sha message contains ' -- ' (space-dash-dash-space)"
+            say "    subject: $subject"
+            fail=1
+        fi
+    done
 
     # Diff additions must not contain forbidden tokens. Content is scanned
     # with per-file context so a narrow allowance can be applied:
