@@ -256,23 +256,44 @@ async def git_proxy(_path: str, request: Request):
             f"git-http-backend not found at {GIT_HTTP_BACKEND}\n", status_code=500
         )
 
-    async def feed_stdin() -> None:
-        try:
-            async for chunk in request.stream():
-                if not chunk:
-                    continue
+    # Drain the request body into the backend's stdin BEFORE reading any
+    # response. git smart-HTTP is stateless-RPC: the client sends the full
+    # request and then reads the full response, no interleaving. Doing
+    # both concurrently triggers a uvicorn-level deadlock -- if the
+    # response coroutine awaits proc.stdout while the backend is still
+    # waiting for stdin EOF, uvicorn's HTTP/1.1 implementation stops
+    # pumping inbound body data, request.stream() starves, stdin EOF
+    # never arrives, and the push hangs with no rejection ever surfacing
+    # to the client. Serialising avoids that entirely.
+    try:
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            try:
                 proc.stdin.write(chunk)
                 await proc.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        finally:
-            try:
+            except (BrokenPipeError, ConnectionResetError):
+                # Backend exited mid-upload. Whatever response it
+                # produced is already on stdout; stop feeding.
+                break
+    except Exception as e:
+        log.info("request body read failed for %s/%s: %r", owner, repo, e)
+    finally:
+        # Closing stdin is the load-bearing step. Without an EOF here,
+        # git-receive-pack -> unpack-objects blocks reading the pack,
+        # the pre-receive hook never runs, and the client eventually
+        # times out with no "remote:" lines.
+        #
+        # Do NOT await wait_closed(): the SubprocessStreamProtocol's
+        # pipe_connection_lost callback can hit InvalidStateError when
+        # the subprocess exits concurrently with our close, which would
+        # leave wait_closed() hanging forever. close() alone is enough
+        # to schedule the kernel-level shutdown.
+        try:
+            if proc.stdin is not None and not proc.stdin.is_closing():
                 proc.stdin.close()
-                await proc.stdin.wait_closed()
-            except Exception:
-                pass
-
-    feeder = asyncio.create_task(feed_stdin())
+        except Exception:
+            pass
 
     # Parse CGI headers. git-http-backend uses LF; tolerate CRLF too.
     assert proc.stdout is not None
@@ -306,13 +327,34 @@ async def git_proxy(_path: str, request: Request):
                     break
                 yield chunk
         finally:
-            try:
-                await feeder
-            except Exception:
-                pass
-            rc = await proc.wait()
+            # Bound how long we wait for the backend itself. If it
+            # hasn't exited cleanly by the time we've drained stdout,
+            # something is stuck (commonly: a hung upstream push from
+            # the pre-receive hook). Terminate, then escalate to
+            # SIGKILL, so we don't leak processes or sockets.
+            if proc.returncode is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    rc = await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    rc = await proc.wait()
+            else:
+                rc = proc.returncode
+
             if proc.stderr is not None:
-                err = await proc.stderr.read()
+                try:
+                    err = await asyncio.wait_for(
+                        proc.stderr.read(), timeout=2.0
+                    )
+                except asyncio.TimeoutError:
+                    err = b""
                 if err:
                     for line in err.decode(errors="replace").splitlines():
                         log.info(
