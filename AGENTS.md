@@ -98,6 +98,50 @@ Current rules:
 - commit message has any non-empty body (single-line subjects only)
 - commit message contains ` -- ` (space-dash-dash-space)
 
+## The bypass escape hatch
+
+`scripts/git-bypass-push` is the supported way for the human user to push
+through the proxy while skipping every pre-receive rule for one push. It
+exists because the old escape hatch ("manually add a direct-to-GitHub
+remote, force-push, remove it") is error-prone -- one mistyped refspec
+and a repo is gone.
+
+How a bypass push flows end-to-end:
+
+1. The user runs `git bypass-push [args...]` at a terminal.
+2. The wrapper validates that the current remote points at the proxy,
+   refuses if stdin/stdout aren't TTYs, and demands the literal string
+   `YES`.
+3. The wrapper reads `/etc/llm-git-guard/bypass-token` and runs
+   `git -c http.extraHeader="X-LLMGG-Bypass: <token>" push [args...]`.
+4. The proxy compares the header against the token it loaded at startup
+   (`hmac.compare_digest`). On match it sets `LLMGG_BYPASS=1` in the
+   environment of the spawned `git-http-backend`.
+5. `hooks/pre-receive` sees `LLMGG_BYPASS=1` and, for every ref on stdin,
+   builds a `+new:ref` (or `:ref` for deletions) refspec without running
+   any validation, then forwards them to upstream as before.
+
+What this gives the user that the old "add remote + force push" dance did
+not: the URL is unchanged, so `--force-with-lease` actually leases against
+the same view of the world the user has been fetching against. No remote
+mutation, no chance of pushing to the wrong URL, no chance of forgetting
+to remove the temporary remote.
+
+Key invariants when changing any part of this:
+
+- The TTY gate (`[[ ! -t 0 || ! -t 1 ]]`) is the load-bearing safety
+  property, not the token. The token file is readable by the user, so any
+  agent script running as that user could in principle construct the
+  header -- the gate is what prevents that path. Don't add a flag that
+  skips the gate.
+- The wrapper must keep the URL identical to what the user has configured
+  for `origin` (only attaches a header). Anything that changes the URL
+  breaks `--force-with-lease`'s remote-tracking-ref math.
+- `pre-receive` must continue to forward with `+`-prefixed refspecs in
+  bypass mode -- otherwise deletions and rewinds reach upstream but
+  upstream rejects them.
+- The proxy must use a constant-time comparison for the header check.
+
 ## Commit message rules for *this* repo
 
 The pre-receive hook applies the subject-hygiene rules to its own

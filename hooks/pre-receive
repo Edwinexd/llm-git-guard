@@ -16,6 +16,14 @@ KNOWN_HOSTS="${LLMGG_KNOWN_HOSTS:-/root/.ssh/known_hosts}"
 CONFIG_DIR="${LLMGG_CONFIG_DIR:-/etc/llm-git-guard}"
 EXEMPT_FILE="${CONFIG_DIR}/exempt-repos.txt"
 
+# When the proxy accepts a valid X-LLMGG-Bypass header it sets LLMGG_BYPASS=1
+# in our env. That means a human has confirmed at a TTY (via git-bypass-push)
+# that this push should skip every validation rule in this file -- deletions,
+# force pushes, vendor regex, subject hygiene, the CLAUDE.md symlink rule,
+# everything. The hook still forwards the result to upstream, but with +refspec
+# / --force so deletions and rewinds actually propagate.
+BYPASS="${LLMGG_BYPASS:-0}"
+
 MAX_DELETED_LINES="${LLMGG_MAX_DELETED_LINES:-2000}"
 MAX_DELETED_FILES="${LLMGG_MAX_DELETED_FILES:-50}"
 # Cap on commit subject length (chars). 72 is the standard git subject
@@ -51,6 +59,10 @@ if [[ -f "$EXEMPT_FILE" ]] && grep -qFx "$REPO_ID" "$EXEMPT_FILE"; then
     say "note: $REPO_ID is exempt from token checks (force-push and deletion limits still enforced)"
 fi
 
+if [[ "$BYPASS" == "1" ]]; then
+    say "BYPASS ACTIVE for $REPO_ID -- skipping all validation rules"
+fi
+
 fail=0
 declare -a refspecs=()
 
@@ -59,6 +71,18 @@ empty_tree=$(git hash-object -t tree /dev/null 2>/dev/null \
 
 while read -r old new ref; do
     [[ -z "${ref:-}" ]] && continue
+
+    # Bypass: trust the human-confirmed push entirely. Build a force-prefixed
+    # refspec (or :ref for deletion) and let the downstream forward push it.
+    # All the rules below are skipped for this ref.
+    if [[ "$BYPASS" == "1" ]]; then
+        if [[ "$new" =~ ^0+$ ]]; then
+            refspecs+=(":${ref}")
+        else
+            refspecs+=("+${new}:${ref}")
+        fi
+        continue
+    fi
 
     # Ref deletion (new == 40 zeros). Permitted for non-protected refs --
     # feature branches, obsolete topic branches, etc. are legitimate to

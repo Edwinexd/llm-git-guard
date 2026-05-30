@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# git-bypass-push: push through llm-git-guard while skipping the pre-receive
+# checks for one push. Use when a rule is legitimately in the way and you
+# need to ship anyway -- e.g. recovering from a destructive accident.
+#
+# Invoke as a git subcommand:
+#
+#     git bypass-push                       # current branch, normal push
+#     git bypass-push --force-with-lease    # rewind protection still helps
+#     git bypass-push origin :refs/heads/x  # delete a protected branch
+#
+# How it works:
+#   1. Resolves the target remote and confirms its URL points at the proxy.
+#   2. Reads the bypass token from /etc/llm-git-guard/bypass-token.
+#   3. Refuses to run unless stdin AND stdout are both TTYs. That is the only
+#      thing keeping non-interactive callers (agent scripts, cron jobs, etc.)
+#      from using this command. The token alone is not a secret -- any user
+#      who can read the file can construct the header -- so the TTY gate is
+#      the actual safety property.
+#   4. Prints what is about to happen and demands the literal string YES.
+#   5. Exec's `git push` with the bypass token attached as an HTTP header via
+#      http.extraHeader. The URL is unchanged, so --force-with-lease and any
+#      other client-side checks behave exactly as they would on a normal push.
+#
+# The proxy validates the header (constant-time compare against the token
+# file it loaded at startup), then sets LLMGG_BYPASS=1 into the pre-receive
+# hook's environment. The hook skips every validation rule and forwards the
+# push to GitHub with force-prefixed refspecs.
+set -uo pipefail
+
+PROG=git-bypass-push
+PROXY="${LLMGG_PROXY:-http://127.0.0.1:9419}"
+TOKEN_FILE="${LLMGG_BYPASS_TOKEN_FILE:-/etc/llm-git-guard/bypass-token}"
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+
+git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
+
+# Find the remote we're pushing to. git push's CLI is "push [opts] [remote
+# [refspec...]]", so the first non-flag arg is the remote. Default origin.
+remote=origin
+for a in "$@"; do
+    case "$a" in
+        -*) ;;
+        *) remote="$a"; break ;;
+    esac
+done
+
+url=$(git config --get "remote.$remote.url" 2>/dev/null || true)
+[[ -n "$url" ]] || die "remote '$remote' has no URL configured"
+
+# Only proxy URLs are sensible here. A direct GitHub URL would defeat the
+# point (no proxy in front to bypass) and would silently fail when GitHub
+# refused the unknown header anyway.
+if [[ "$url" != "$PROXY"/* ]]; then
+    die "remote '$remote' is $url -- expected to start with $PROXY"
+fi
+
+if [[ ! -t 0 || ! -t 1 ]]; then
+    die "refusing non-interactive use; bypass requires a TTY confirmation"
+fi
+
+[[ -r "$TOKEN_FILE" ]] || die "cannot read $TOKEN_FILE -- has install.sh been run?"
+token=$(< "$TOKEN_FILE")
+[[ -n "$token" ]] || die "$TOKEN_FILE is empty"
+
+branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo '(detached HEAD)')
+head=$(git rev-parse --short HEAD 2>/dev/null || echo '?')
+subject=$(git log -1 --format='%s' 2>/dev/null || true)
+
+cat >&2 <<EOF
+
+$PROG: about to BYPASS llm-git-guard validation.
+    remote:  $remote ($url)
+    HEAD:    $branch @ $head $subject
+    command: git push $*
+
+This single push will skip the vendor-token scan, deletion budget,
+force-push rejection, subject-hygiene rules and the CLAUDE.md symlink
+policy. The push is still forwarded to GitHub.
+
+Type YES (exactly, uppercase) to proceed; anything else aborts.
+EOF
+
+read -r -p "> " answer
+[[ "$answer" == "YES" ]] || die "aborted"
+
+exec git -c http.extraHeader="X-LLMGG-Bypass: $token" push "$@"

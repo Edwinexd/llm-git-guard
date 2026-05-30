@@ -60,6 +60,33 @@ Per-repo exceptions live in `/etc/llm-git-guard/exempt-repos.txt` (one
 `owner/name` per line). Exempt repos still have force-push and deletion
 limits enforced — only vendor-token checks are skipped.
 
+## Bypass for one push
+
+When a rule is in the way and you've decided the push is safe (recovering
+from a destructive accident, importing a vendored chunk that trips the
+regex, etc.), use the wrapper instead of hand-rolling a direct-to-GitHub
+remote:
+
+```sh
+git bypass-push                       # current branch
+git bypass-push --force-with-lease    # rewind a feature branch
+git bypass-push origin :refs/heads/x  # delete a protected branch
+```
+
+The wrapper refuses unless both stdin and stdout are TTYs and you type
+`YES` at the prompt. It then attaches the contents of
+`/etc/llm-git-guard/bypass-token` as an `X-LLMGG-Bypass` header on a normal
+`git push` against the proxy URL — so `--force-with-lease` and any other
+client-side checks behave exactly as they would on an ordinary push. The
+proxy validates the header (constant-time compare), the pre-receive hook
+skips every rule, and the resulting push is forwarded to GitHub with
+force-prefixed refspecs.
+
+The TTY gate is the actual safety property: the token file is readable by
+your user, so an agent running as you could in principle construct the
+header, but it would need an interactive terminal to satisfy the wrapper.
+If you want stronger isolation, tighten the token file's group ownership.
+
 ## Install
 
 Requirements: Docker Engine with the `compose` plugin.
@@ -150,6 +177,7 @@ in `docker-compose.yml` or with a `.env` file next to it.
 | `LLMGG_SUBJECT_MAX` | `72` | max commit subject length (chars). New commits with longer subjects, non-empty bodies, or ` -- ` in the message are rejected. Applies to all repos including those in `exempt-repos.txt`. |
 | `LLMGG_FORBIDDEN_RE` | vendor pattern | regex applied case-insensitively |
 | `LLMGG_PROTECTED_REFS_RE` | `^refs/heads/(main\|master\|develop\|trunk\|prod\|production\|release/.*)$` | refs whose deletion is always refused (default branch is also protected dynamically) |
+| `LLMGG_BYPASS_TOKEN_FILE` | `/etc/llm-git-guard/bypass-token` | path to the shared secret accepted in `X-LLMGG-Bypass`. Read once at startup; restart the container to rotate. Empty / missing disables the bypass feature entirely. |
 | `LLMGG_LOG_LEVEL` | `info` | Python/Uvicorn log level |
 
 ## Development

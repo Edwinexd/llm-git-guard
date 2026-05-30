@@ -41,6 +41,23 @@ else
     echo "   (leaving existing $CONFIG_DIR/exempt-repos.txt untouched)"
 fi
 
+# Bypass token. Read by the proxy at startup to validate X-LLMGG-Bypass
+# headers from git-bypass-push. Owned root:<invoker-group> so the unprivileged
+# user can read it without sudo; the container reads it as root regardless.
+BYPASS_TOKEN_FILE="$CONFIG_DIR/bypass-token"
+if [[ ! -s "$BYPASS_TOKEN_FILE" ]]; then
+    install -m 640 /dev/null "$BYPASS_TOKEN_FILE"
+    # 32 random bytes hex-encoded; plenty of entropy, fits on one line.
+    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$BYPASS_TOKEN_FILE"
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        invoker_group=$(id -gn "$SUDO_USER")
+        chgrp "$invoker_group" "$BYPASS_TOKEN_FILE"
+    fi
+    echo "   generated $BYPASS_TOKEN_FILE"
+else
+    echo "   (leaving existing $BYPASS_TOKEN_FILE untouched)"
+fi
+
 echo "==> SSH key sanity check"
 if [[ ! -f /root/.ssh/id_ed25519 ]]; then
     echo "   WARNING: /root/.ssh/id_ed25519 missing -- upstream pushes will fail"
@@ -66,7 +83,10 @@ Next steps:
          ln -sf $PREFIX/scripts/gh-sync ~/.local/bin/gh-sync
   3. Make sure /root/.ssh/id_ed25519 is your GitHub key and your user no
      longer has a copy.
-  4. Optional: install the ssh-authd wrapper so ordinary ssh/scp/sftp for
+  4. Make 'git bypass-push' available as a git subcommand for one-off
+     bypasses (a TTY-confirmed escape hatch for when a rule is in the way):
+         ln -sf $PREFIX/scripts/git-bypass-push ~/.local/bin/git-bypass-push
+  5. Optional: install the ssh-authd wrapper so ordinary ssh/scp/sftp for
      your user go through root's key and refuse GitHub targets:
          sudo $PREFIX/scripts/install-ssh-authd.sh <username>
 EOF

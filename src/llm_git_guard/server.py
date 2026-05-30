@@ -18,6 +18,7 @@ once multiple clients are cloning/pushing through the same instance.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 import re
@@ -46,8 +47,27 @@ UPSTREAM_TEMPLATE = os.environ.get(
 )
 CLONE_TIMEOUT = int(os.environ.get("LLMGG_CLONE_TIMEOUT", "300"))
 FETCH_TIMEOUT = int(os.environ.get("LLMGG_FETCH_TIMEOUT", "120"))
+BYPASS_TOKEN_FILE = Path(os.environ.get(
+    "LLMGG_BYPASS_TOKEN_FILE", "/etc/llm-git-guard/bypass-token"
+))
 
 log = logging.getLogger("llm-git-guard")
+
+
+def _load_bypass_token() -> str:
+    """Read the bypass token from disk at startup.
+
+    Empty string (file missing, empty, or unreadable) disables the bypass
+    feature entirely: no header value can satisfy ``hmac.compare_digest("", x)``
+    in the presence of the ``not BYPASS_TOKEN`` short-circuit below.
+    """
+    try:
+        return BYPASS_TOKEN_FILE.read_text().strip()
+    except OSError:
+        return ""
+
+
+BYPASS_TOKEN = _load_bypass_token()
 
 # ``<owner>/<repo>[.git]/<rest>`` -- owner/repo charset matches what GitHub
 # allows so a crafted URL cannot escape ``REPOS_DIR``.
@@ -214,6 +234,22 @@ async def git_proxy(_path: str, request: Request):
     if service == "git-upload-pack":
         await refresh_mirror(repo_dir)
 
+    # Optional bypass: a confirmed-at-the-keyboard wrapper (git-bypass-push)
+    # sends X-LLMGG-Bypass with the contents of /etc/llm-git-guard/bypass-token.
+    # When it matches we set LLMGG_BYPASS=1 into the hook's environment; the
+    # hook then accepts the push as-is and force-forwards every ref. We use
+    # hmac.compare_digest to avoid leaking the token via timing. If the token
+    # file was missing at startup BYPASS_TOKEN is "" and no header value can
+    # ever enable bypass.
+    bypass = False
+    hdr = request.headers.get("x-llmgg-bypass", "")
+    if BYPASS_TOKEN and hdr and hmac.compare_digest(hdr, BYPASS_TOKEN):
+        bypass = True
+        log.warning(
+            "bypass header accepted for %s %s/%s (validation will be skipped)",
+            service or rest, owner, repo,
+        )
+
     env = {
         "GIT_PROJECT_ROOT": str(REPOS_DIR),
         "GIT_HTTP_EXPORT_ALL": "1",
@@ -242,6 +278,8 @@ async def git_proxy(_path: str, request: Request):
     gp = request.headers.get("git-protocol")
     if gp:
         env["HTTP_GIT_PROTOCOL"] = gp
+    if bypass:
+        env["LLMGG_BYPASS"] = "1"
 
     try:
         proc = await asyncio.create_subprocess_exec(
