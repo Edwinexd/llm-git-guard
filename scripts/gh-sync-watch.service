@@ -1,0 +1,17 @@
+[Unit]
+Description=gh-sync live watcher - clone newly created GitHub repos into ~/repos within ~a minute
+Documentation=https://github.com/Edwinexd/llm-git-guard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/gh-sync-watch
+Restart=on-failure
+RestartSec=10
+# gh (/usr/bin), git, curl + node (nvm, for paseo-register-repos)
+Environment=PATH=%h/.nvm/versions/node/v25.9.0/bin:/usr/local/bin:/usr/bin:/bin
+Environment=GH_SYNC_WATCH_INTERVAL=65
+
+[Install]
+WantedBy=default.target
