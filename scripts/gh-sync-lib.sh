@@ -31,6 +31,30 @@ list_remote_repos() {
         --jq '.[] | select(.archived == false) | "\(.owner.login)\t\(.name)"'
 }
 
+# Heal a clone that was created while its upstream was still empty. git clone
+# of an empty repo writes no remote.origin.fetch refspec and parks HEAD at the
+# refs/heads/.invalid sentinel; because we only ever fetch (never pull/checkout)
+# the clone never recovers once upstream gains commits, leaving a working tree
+# with an unresolvable HEAD that breaks tools running `git branch` there.
+# Guarded on the broken state so a healthy checkout is never disturbed.
+repair_clone() {
+    local dest="$1"
+    if ! git -C "$dest" config --get remote.origin.fetch >/dev/null 2>&1; then
+        git -C "$dest" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+        git -C "$dest" fetch --prune --quiet 2>/dev/null || true
+    fi
+    if ! git -C "$dest" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+        git -C "$dest" remote set-head origin -a >/dev/null 2>&1 || true
+        local def
+        def=$(git -C "$dest" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)
+        def="${def#origin/}"
+        if [[ -n "$def" ]] && git -C "$dest" rev-parse --verify -q "refs/remotes/origin/$def" >/dev/null 2>&1; then
+            git -C "$dest" checkout -q "$def" 2>/dev/null \
+                && echo "repair: $dest (healed empty-clone HEAD -> $def)"
+        fi
+    fi
+}
+
 # Clone if missing, else repoint origin to the proxy and fetch. Always registers.
 # Echoes a status line; returns non-zero on clone/fetch failure.
 sync_repo() {
@@ -50,6 +74,7 @@ sync_repo() {
         else
             echo "fetch FAIL: $owner/$name"; rc=1
         fi
+        repair_clone "$dest"
     else
         mkdir -p "$REPOS_DIR/$owner"
         if git clone --quiet "$proxy_url" "$dest" 2>/dev/null; then
