@@ -41,6 +41,38 @@ PROTECTED_REFS_RE="${LLMGG_PROTECTED_REFS_RE:-^refs/heads/(main|master|develop|t
 
 say() { printf 'llm-git-guard: %s\n' "$*" >&2; }
 
+# Message hygiene for one commit message: subject length, empty body, no
+# " -- ". Factored out because the commit-msg hook that scripts/install-hooks
+# writes calls it through LLMGG_CHECK_MESSAGE below, so a client checking
+# early and this hook checking at push time cannot drift: they are the same
+# code reading the same defaults. $1 is what to name in a rejection, $2 the
+# whole message. Returns 1 if anything failed.
+check_message() {
+    local prefix="$1" full="$2" bad=0 subject body
+    subject=$(printf '%s' "$full" | head -1)
+    # Everything after the subject line. git's %b drops the blank separator;
+    # keeping it is harmless because the test below ignores whitespace.
+    body=$(printf '%s\n' "$full" | tail -n +2)
+    if (( ${#subject} > SUBJECT_MAX )); then
+        say "REJECT $prefix subject is ${#subject} chars (cap is $SUBJECT_MAX)"
+        say "    subject: $subject"
+        bad=1
+    fi
+    # Treat whitespace-only bodies as empty -- some editors leave a
+    # trailing blank line and we don't want to reject for that.
+    if [[ "$body" =~ [^[:space:]] ]]; then
+        say "REJECT $prefix has a multi-line message (subject only, body must be empty)"
+        say "    subject: $subject"
+        bad=1
+    fi
+    if [[ "$full" == *" -- "* ]]; then
+        say "REJECT $prefix message contains ' -- ' (space-dash-dash-space)"
+        say "    subject: $subject"
+        bad=1
+    fi
+    return $bad
+}
+
 # Resolve the mirror's default branch -- this is what GitHub says is the
 # repo's default, because git-clone --mirror copies the remote HEAD symref.
 default_ref="$(git symbolic-ref HEAD 2>/dev/null || true)"
@@ -57,6 +89,26 @@ exempt=0
 if [[ -f "$EXEMPT_FILE" ]] && grep -qFx "$REPO_ID" "$EXEMPT_FILE"; then
     exempt=1
     say "note: $REPO_ID is exempt from token checks (force-push and deletion limits still enforced)"
+fi
+
+# Client entry point: check one commit message file and exit, without any of
+# the push machinery. The commit-msg hook scripts/install-hooks writes uses
+# this so a bad subject is caught at `git commit`, not after fifty of them
+# have piled up behind a rejected push. Comments and trailing blanks go the
+# way `git commit` strips them, so what is checked is what would be stored.
+if [[ -n "${LLMGG_CHECK_MESSAGE:-}" ]]; then
+    if [[ ! -r "$LLMGG_CHECK_MESSAGE" ]]; then
+        say "cannot read message file: $LLMGG_CHECK_MESSAGE"
+        exit 1
+    fi
+    msg=$(git stripspace --strip-comments < "$LLMGG_CHECK_MESSAGE")
+    rc=0
+    check_message "this commit" "$msg" || rc=1
+    if (( ! exempt )) && printf '%s' "$msg" | grep -qiE "$FORBIDDEN_RE"; then
+        say "REJECT this commit message matches /$FORBIDDEN_RE/i"
+        rc=1
+    fi
+    exit $rc
 fi
 
 if [[ "$BYPASS" == "1" ]]; then
@@ -163,27 +215,7 @@ while read -r old new ref; do
     # detection, and llm-git-guard's own commits should follow it too.
     for sha in "${commits[@]}"; do
         [[ -z "$sha" ]] && continue
-        subject=$(git log -1 --format='%s' "$sha")
-        # $() strips trailing newlines, so an empty body really tests as "".
-        body=$(git log -1 --format='%b' "$sha")
-        full=$(git log -1 --format='%B' "$sha")
-        if (( ${#subject} > SUBJECT_MAX )); then
-            say "REJECT $ref: commit $sha subject is ${#subject} chars (cap is $SUBJECT_MAX)"
-            say "    subject: $subject"
-            fail=1
-        fi
-        # Treat whitespace-only bodies as empty -- some editors leave a
-        # trailing blank line and we don't want to reject for that.
-        if [[ "$body" =~ [^[:space:]] ]]; then
-            say "REJECT $ref: commit $sha has a multi-line message (subject only, body must be empty)"
-            say "    subject: $subject"
-            fail=1
-        fi
-        if [[ "$full" == *" -- "* ]]; then
-            say "REJECT $ref: commit $sha message contains ' -- ' (space-dash-dash-space)"
-            say "    subject: $subject"
-            fail=1
-        fi
+        check_message "$ref: commit $sha" "$(git log -1 --format='%B' "$sha")" || fail=1
     done
 
     # Diff additions must not contain forbidden tokens. Content is scanned
@@ -284,6 +316,15 @@ done
 if (( fail )); then
     say "push rejected; no refs updated"
     exit 1
+fi
+
+# Client entry point: the pre-push hook scripts/install-hooks writes feeds this
+# script the refs it is about to send and stops here. Everything above has run
+# against the client's own objects, so what it reports is what the proxy will
+# report -- the point of running this file rather than a second copy of the
+# rules. Nothing is forwarded: the real push has not happened yet.
+if [[ "${LLMGG_VALIDATE_ONLY:-0}" == "1" ]]; then
+    exit 0
 fi
 
 if (( ${#refspecs[@]} == 0 )); then
