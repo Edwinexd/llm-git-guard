@@ -10,10 +10,18 @@ the host machine and GitHub. It runs as a Docker container bound to
 `/var/lib/llm-git-guard/repos`, and validates every push through a
 `pre-receive` hook before forwarding to GitHub with root's SSH key.
 
-This is **not** a Claude Code hook, a git client wrapper, or a commit
-message linter for any one repo. It is server-side infrastructure —
-the validation runs inside `git-receive-pack` on the proxy, after the
-client's `git push` has already shipped the pack.
+The validation is server-side: it runs inside `git-receive-pack` on the
+proxy, after the client's `git push` has already shipped the pack. That
+is still where the rules live and where they are enforced.
+
+`scripts/install-hooks` additionally installs client-side `commit-msg`
+and `pre-push` hooks into a working repo, so the same rules are met
+before the pack ships. Those hooks hold no rules of their own: they
+call `hooks/pre-receive` through its `LLMGG_CHECK_MESSAGE` and
+`LLMGG_VALIDATE_ONLY` entry points. A rule added to `pre-receive` is
+therefore picked up by the client hooks for free, and there is no
+second copy to keep in step. These are git hooks in the working repo,
+still **not** the editor-side agent hook described below.
 
 ## Don't confuse it with
 
@@ -38,6 +46,9 @@ src/llm_git_guard/        FastAPI server: proxies smart-HTTP, refreshes mirrors,
                           installs the pre-receive hook into each mirror
 config/exempt-repos.txt   per-repo exemptions (vendor-token only; force-push and
                           subject hygiene still apply)
+scripts/install-hooks     installs client-side commit-msg and pre-push hooks into a
+                          working repo; they delegate to hooks/pre-receive through
+                          its two entry points, never holding a copy of the rules
 scripts/install.sh        copies the repo to /opt/llm-git-guard, builds the image,
                           brings it up under docker compose
 scripts/rewrite-origins.sh   repoint existing client clones at 127.0.0.1:9419
@@ -82,6 +93,12 @@ These are the things to check and update when adding a new rule:
    user sees every problem in one push, not whack-a-mole.
 5. Document the new rule in `README.md`'s "What it blocks" list and
    the config table.
+6. Nothing to do for the client hooks: `scripts/install-hooks` writes
+   hooks that call this same file, so a new rule in the loop reaches
+   them the moment `/opt` is redeployed. Do not add the rule to the
+   hooks as well -- two copies is the failure this arrangement avoids.
+   A message-shaped rule belongs in `check_message()`, so the
+   `commit-msg` hook catches it at `git commit` rather than at push.
 
 Current rules:
 - ref deletions blocked for the default branch and `LLMGG_PROTECTED_REFS_RE`

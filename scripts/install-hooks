@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# install-hooks: put llm-git-guard's rules in front of a repo's own git, so a
+# violation shows up at `git commit` or `git push` instead of as a pre-receive
+# rejection after the pack has already shipped.
+#
+#     install-hooks                    # the repo you are standing in
+#     install-hooks ~/repos/Edthing/ae-dev
+#     install-hooks --all              # every git repo under ~/repos
+#     install-hooks --uninstall        # take them back out
+#
+# Two hooks are written:
+#
+#   commit-msg  rejects a subject over the cap, a non-empty body, " -- ", and
+#               a vendor name in the message, at the moment you write it.
+#   pre-push    runs the whole of hooks/pre-receive against the refs you are
+#               about to send, in validate-only mode.
+#
+# Neither hook contains a copy of the rules. Both invoke the same
+# hooks/pre-receive the proxy runs, through the LLMGG_CHECK_MESSAGE and
+# LLMGG_VALIDATE_ONLY entry points, because a second copy of the rules is a
+# copy that drifts, and a client check that disagrees with the server is worse
+# than no client check at all.
+#
+# What the client cannot know: whether the repo is on the server's exempt list
+# (/etc/llm-git-guard/exempt-repos.txt, not always readable here) and, for a
+# branch the remote has never seen, exactly which commits the server will
+# consider new. Both make the local check stricter, never laxer, so a clean
+# local run can still be followed by a server rejection -- but not the reverse.
+set -uo pipefail
+
+PROG=install-hooks
+REPOS_DIR="${REPOS_DIR:-$HOME/repos}"
+# The deployed copy is what the proxy actually runs; the checkout is the
+# fallback so this works before a deploy, or from a clone somewhere else.
+# Kept in the same order as the hooks resolve at run time, so what this
+# reports and what they use are the same file.
+GUARD_CANDIDATES=(
+    "${LLMGG_HOOK:-}"
+    /opt/llm-git-guard/hooks/pre-receive
+    "$HOME/repos/Edwinexd/llm-git-guard/hooks/pre-receive"
+    "$(dirname "$(dirname "$(readlink -f "$0")")")/hooks/pre-receive"
+)
+# Written into every hook this installs, so a re-run can tell its own work
+# from a hook the repo already had.
+MARKER="installed by llm-git-guard $PROG"
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+note() { printf '%s: %s\n' "$PROG" "$*"; }
+
+# Only a guard carrying the client entry points is usable: an older one would
+# treat our stdin as a push, find no refs, and exit 0.
+resolve_guard() {
+    local c
+    for c in "${GUARD_CANDIDATES[@]}"; do
+        [[ -n "$c" && -r "$c" ]] && grep -q LLMGG_CHECK_MESSAGE "$c" 2>/dev/null \
+            && { printf '%s' "$c"; return 0; }
+    done
+    return 1
+}
+
+usage() {
+    sed -n '2,28p' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+FORCE=0
+UNINSTALL=0
+ALL=0
+declare -a TARGETS=()
+
+while (( $# )); do
+    case "$1" in
+        --all)       ALL=1 ;;
+        --force|-f)  FORCE=1 ;;
+        --uninstall) UNINSTALL=1 ;;
+        -h|--help)   usage 0 ;;
+        -*)          die "unknown flag $1 (try --help)" ;;
+        *)           TARGETS+=("$1") ;;
+    esac
+    shift
+done
+
+# Resolved after the flags so --help works on a machine with no guard at all.
+GUARD=$(resolve_guard) \
+    || die "no hooks/pre-receive with the client entry points found; set LLMGG_HOOK"
+
+if (( ALL )); then
+    [[ ${#TARGETS[@]} -eq 0 ]] || die "--all takes no repo arguments"
+    while IFS= read -r d; do TARGETS+=("$(dirname "$d")"); done \
+        < <(find "$REPOS_DIR" -mindepth 3 -maxdepth 3 -type d -name .git 2>/dev/null | sort)
+    [[ ${#TARGETS[@]} -gt 0 ]] || die "no git repos found under $REPOS_DIR"
+elif [[ ${#TARGETS[@]} -eq 0 ]]; then
+    TARGETS=(".")
+fi
+
+# The body of each hook. Owner and repo are read at run time rather than baked
+# in, so a repo that gets repointed keeps reporting itself correctly.
+common_preamble() {
+    cat <<'PREAMBLE'
+# Resolve the guard the same way the installer did: the deployed copy first,
+# but only one that carries the client entry points. The deployed copy and the
+# checkout drift, and an old guard would read our stdin as a push, find
+# nothing, and exit 0 -- a silent pass, which is worse than no hook at all.
+for c in "${LLMGG_HOOK:-}" /opt/llm-git-guard/hooks/pre-receive \
+         "$HOME/repos/Edwinexd/llm-git-guard/hooks/pre-receive"; do
+    [ -n "$c" ] && [ -r "$c" ] && grep -q LLMGG_CHECK_MESSAGE "$c" 2>/dev/null \
+        && GUARD="$c" && break
+done
+# Not blocking the developer's work over a missing guard, but never quietly:
+# an unchecked commit must not look like a checked one.
+if [ -z "${GUARD:-}" ]; then
+    echo "llm-git-guard: no guard here supports the client entry points;" \
+         "not checking (deploy /opt/llm-git-guard to enable)" >&2
+    exit 0
+fi
+
+# owner/name from the origin URL, for the server's exempt-list lookup.
+url=$(git config --get remote.origin.url 2>/dev/null || true)
+slug=${url%.git}
+slug=${slug##*://*/}
+slug=${slug##*:}
+export LLMGG_OWNER="${slug%%/*}" LLMGG_REPO="${slug##*/}"
+PREAMBLE
+}
+
+write_commit_msg() {
+    { printf '#!/usr/bin/env bash\n# %s\nset -uo pipefail\n\n' "$MARKER"
+      common_preamble
+      cat <<'BODY'
+
+# One message, checked by the same code the proxy will run over it later.
+LLMGG_CHECK_MESSAGE="$1" exec bash "$GUARD"
+BODY
+    } > "$1"
+    chmod +x "$1"
+}
+
+write_pre_push() {
+    { printf '#!/usr/bin/env bash\n# %s\nset -uo pipefail\n\n' "$MARKER"
+      common_preamble
+      cat <<'BODY'
+
+# git hands us "<local ref> <local sha> <remote ref> <remote sha>"; the guard
+# reads "<old> <new> <ref>", which is the same four fields in the order the
+# server would have seen them.
+refs=$(while read -r localref localsha remoteref remotesha; do
+    [ -n "${remoteref:-}" ] || continue
+    printf '%s %s %s\n' "$remotesha" "$localsha" "$remoteref"
+done)
+[ -n "$refs" ] && printf '%s\n' "$refs" | LLMGG_VALIDATE_ONLY=1 bash "$GUARD"
+BODY
+    } > "$1"
+    chmod +x "$1"
+}
+
+is_ours() { [[ -f "$1" ]] && grep -qF "$MARKER" "$1"; }
+
+install_one() {
+    local repo="$1" dir hooks
+    dir=$(git -C "$repo" rev-parse --git-dir 2>/dev/null) \
+        || { note "skip $repo (not a git repo)"; return 1; }
+    # --git-dir is relative to the repo, and a worktree keeps its hooks in the
+    # common dir rather than beside its own HEAD.
+    hooks=$(git -C "$repo" rev-parse --git-path hooks)
+    [[ "$hooks" = /* ]] || hooks="$repo/$hooks"
+    mkdir -p "$hooks"
+
+    local name path
+    for name in commit-msg pre-push; do
+        path="$hooks/$name"
+        if [[ -e "$path" ]] && ! is_ours "$path" && (( ! FORCE )); then
+            note "skip $repo: $name exists and is not ours (use --force)"
+            return 1
+        fi
+        if (( UNINSTALL )); then
+            if is_ours "$path"; then rm -f "$path"; else continue; fi
+        else
+            case "$name" in
+                commit-msg) write_commit_msg "$path" ;;
+                pre-push)   write_pre_push "$path" ;;
+            esac
+        fi
+    done
+
+    if (( UNINSTALL )); then
+        note "removed from $repo"
+        return 0
+    fi
+
+    # A repo that does not push through the proxy will never meet these rules
+    # server-side, so say so rather than letting the hooks imply otherwise.
+    local url
+    url=$(git -C "$repo" config --get remote.origin.url 2>/dev/null || true)
+    if [[ -n "$url" && "$url" != *"127.0.0.1:9419"* ]]; then
+        note "installed in $repo (note: origin is not the proxy, $url)"
+    else
+        note "installed in $repo"
+    fi
+}
+
+rc=0
+for t in "${TARGETS[@]}"; do
+    install_one "$t" || rc=1
+done
+exit $rc

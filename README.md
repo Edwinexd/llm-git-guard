@@ -60,6 +60,51 @@ Per-repo exceptions live in `/etc/llm-git-guard/exempt-repos.txt` (one
 `owner/name` per line). Exempt repos still have force-push and deletion
 limits enforced — only vendor-token checks are skipped.
 
+## Client-side hooks
+
+The rules above run inside `git-receive-pack`, which means you find out a
+commit was wrong only once the whole pack has shipped and the push is
+rejected. On a large push that is a bad trade: a single over-long subject
+fifty commits back rejects the lot, and fixing it is a history rewrite.
+
+`scripts/install-hooks` puts the same rules in front of your own git:
+
+```sh
+install-hooks                       # the repo you are standing in
+install-hooks ~/repos/Edthing/ae-dev
+install-hooks --all                 # every git repo under ~/repos
+install-hooks --uninstall
+```
+
+It writes two hooks:
+
+| hook | when | what it checks |
+|---|---|---|
+| `commit-msg` | `git commit` | subject cap, empty body, no `" -- "`, no vendor name in the message |
+| `pre-push` | `git push` | every rule in `hooks/pre-receive`, over the refs about to be sent |
+
+Neither hook contains a copy of the rules. Both invoke the same
+`hooks/pre-receive` the proxy runs, through its `LLMGG_CHECK_MESSAGE` and
+`LLMGG_VALIDATE_ONLY` entry points, because a second copy of the rules is a
+copy that drifts and a client check that disagrees with the server is worse
+than no client check.
+
+For the same reason the hooks refuse to use a `pre-receive` that predates
+those entry points: an old one would read their stdin as a push, find no
+refs and exit 0, which reads exactly like a pass. They say so on stderr and
+let the command through rather than blocking your work silently. If you see
+that message, deploy `/opt/llm-git-guard` (see Install).
+
+Two things the client cannot know for certain: whether the server will treat
+the repo as exempt, and, for a branch the remote has never seen, exactly
+which commits it will treat as new. So the two can disagree in either
+direction — a clean local run can still meet a server rejection. Treat the
+hooks as a way to catch the ordinary mistake early, not as proof the push
+will land.
+
+An existing `commit-msg` or `pre-push` that this script did not write is left
+alone unless you pass `--force`.
+
 ## Bypass for one push
 
 When a rule is in the way and you've decided the push is safe (recovering
@@ -112,6 +157,10 @@ Then, from your user account:
 
 # Make future clones use the proxy (replaces the old gh-sync).
 ln -sf /opt/llm-git-guard/scripts/gh-sync ~/.local/bin/gh-sync
+
+# Catch violations at commit and push time instead of at the proxy.
+ln -sf /opt/llm-git-guard/scripts/install-hooks ~/.local/bin/install-hooks
+install-hooks --all
 ```
 
 Finally, move the SSH key out of your user account so there's no way for a
