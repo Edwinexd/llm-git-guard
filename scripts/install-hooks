@@ -124,9 +124,13 @@ fi
 
 # owner/name from the origin URL, for the server's exempt-list lookup.
 url=$(git config --get remote.origin.url 2>/dev/null || true)
+# http(s)/ssh URLs carry a host (and maybe a port) before owner/name; the
+# scp form carries it before a colon.
 slug=${url%.git}
-slug=${slug##*://*/}
-slug=${slug##*:}
+case "$slug" in
+    *://*) slug=${slug#*://}; slug=${slug#*/} ;;
+    *:*)   slug=${slug#*:} ;;
+esac
 export LLMGG_OWNER="${slug%%/*}" LLMGG_REPO="${slug##*/}"
 PREAMBLE
 }
@@ -167,7 +171,11 @@ refs=$(while read -r localref localsha remoteref remotesha; do
     [ -n "${remoteref:-}" ] || continue
     printf '%s %s %s\n' "$remotesha" "$localsha" "$remoteref"
 done)
-[ -n "$refs" ] && printf '%s\n' "$refs" | LLMGG_VALIDATE_ONLY=1 bash "$GUARD"
+# git leaves out refs it has already rejected itself (non-fast-forward against
+# the advertised tip, for one). Nothing left means nothing to check: exit 0 so
+# git goes on to print its own rejection, rather than failing with no reason.
+[ -n "$refs" ] || exit 0
+printf '%s\n' "$refs" | LLMGG_VALIDATE_ONLY=1 bash "$GUARD"
 BODY
     } > "$1"
     chmod +x "$1"
